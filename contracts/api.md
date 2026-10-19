@@ -753,5 +753,9 @@ at (`mailbox_id`).
   `Auto-Submitted: auto-generated` and `X-Auto-Response-Suppress: All`, at most 3 per ticket and 10
   per contact per hour.
 
+### Support channels (owner: backend-supportchannels)
+Support-channel connections, destinations, account linking and signed inbound hooks are
+defined in `contracts/support-channels.md`.
+
 ### System
 `GET /healthz` (liveness), `GET /readyz` (db + nats), `GET /v1/openapi.json`, `GET /docs` (API reference UI).

@@ -834,6 +834,33 @@ export type Integration = {
   synced_at: string | null;
   created_at: string;
 };
+/** An agent-facing provider that mirrors email tickets into its own threads. */
+export type SupportChannelProvider = {
+  key: string;
+  name: string;
+  description: string;
+  fields: { name: string; label: string; secret: boolean; help?: string }[];
+};
+export type SupportChannelConnection = {
+  id: string;
+  provider: string;
+  name: string;
+  external_account_id: string;
+  external_account_name: string;
+  status: "connected" | "error";
+  last_error: string;
+  webhook_url: string;
+  created_at: string;
+};
+export type SupportChannelDestination = {
+  id: string;
+  connection_id: string;
+  team_id: string | null;
+  external_channel_id: string;
+  external_channel_name: string;
+  enabled: boolean;
+  created_at: string;
+};
 export type TicketLink = {
   id: string;
   ticket_id: string;

@@ -67,6 +67,8 @@ const simpleLists: Record<string, { key: readonly unknown[]; field: string }> = 
   routing_rule: { key: qk.routingRules, field: "routing_rule" },
   webhook: { key: qk.webhooks, field: "webhook" },
   integration: { key: qk.integrations, field: "integration" },
+  support_channel_connection: { key: qk.supportChannelConnections, field: "support_channel_connection" },
+  support_channel_destination: { key: qk.supportChannelDestinations, field: "support_channel_destination" },
 };
 
 /** What an import has written so far, to tell whether lists have news. */
@@ -395,6 +397,10 @@ export function applyEnvelope(qc: QueryClient, env: Envelope, ctx: ApplyContext)
     else {
       const row = d[simple.field] as { id: string } | undefined;
       if (row) upsertInList(qc, simple.key, row);
+    }
+    if (resource === "support_channel_connection" && verb === "deleted") {
+      const id = d.support_channel_connection_id as string;
+      qc.setQueryData<{ connection_id: string }[]>(qk.supportChannelDestinations, (old) => old?.filter((x) => x.connection_id !== id));
     }
     if (resource === "view") refreshCounts(qc);
     // Tickets name their brand and widget; a removed one leaves lists to refetch.

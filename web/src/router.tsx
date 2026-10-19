@@ -525,6 +525,14 @@ const sMailboxes = createRoute({
   component: page(() => import("./pages/settings/Mailboxes")),
   staticData: { title: "Mailboxes" },
 });
+const sSupportChannels = settingsPage("/support-channels", "Support channels", () => import("./pages/settings/SupportChannels"), (qc) =>
+  Promise.all([
+    qc.ensureQueryData(q.supportChannelProviders()),
+    qc.ensureQueryData(q.supportChannelConnections()),
+    qc.ensureQueryData(q.supportChannelDestinations()),
+    qc.ensureQueryData(q.teams()),
+  ]),
+);
 const sMailboxNew = createRoute({
   getParentRoute: () => settingsLayout,
   path: "/mailboxes/new",
@@ -753,6 +761,7 @@ const routeTree = rootRoute.addChildren([
       sRouting,
       sRoutingRule,
       sMailboxes,
+      sSupportChannels,
       sMailboxNew,
       sMailboxDetail,
       sTags,

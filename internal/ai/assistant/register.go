@@ -242,7 +242,7 @@ func (s *Service) register(api huma.API) {
 		Tags: tags, Middlewares: huma.Middlewares{s.sse(s.streamMessage)}},
 		func(ctx context.Context, in *struct {
 			ID   uuid.UUID `path:"id"`
-			Body MessageInput
+			Body AssistantMessageInput
 		}) (*struct{ Body RunResult }, error) {
 			col := &collector{}
 			if err := s.sendMessage(ctx, in.ID, in.Body, col.emit); err != nil {

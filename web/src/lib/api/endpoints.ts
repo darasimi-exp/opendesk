@@ -331,6 +331,18 @@ export const api = {
       http.patch<T.Integration>(`/v1/integrations/${id}`, b),
     remove: (id: string) => http.del(`/v1/integrations/${id}`),
   },
+  supportChannels: {
+    providers: () => http.get<{ data: T.SupportChannelProvider[] }>("/v1/support-channels/providers"),
+    connections: () => http.get<{ data: T.SupportChannelConnection[] }>("/v1/support-channels/connections"),
+    connect: (b: { provider: string; name?: string; credentials: Record<string, string> }) =>
+      http.create<T.SupportChannelConnection>("/v1/support-channels/connections", b),
+    disconnect: (id: string) => http.del(`/v1/support-channels/connections/${id}`),
+    destinations: () => http.get<{ data: T.SupportChannelDestination[] }>("/v1/support-channels/destinations"),
+    addDestination: (b: { connection_id: string; team_id?: string; external_channel_id: string; external_channel_name?: string }) =>
+      http.create<T.SupportChannelDestination>("/v1/support-channels/destinations", b),
+    removeDestination: (id: string) => http.del(`/v1/support-channels/destinations/${id}`),
+    linkCode: () => http.create<{ code: string; expires_at: string }>("/v1/me/support-channel-link-code", {}),
+  },
   imports: {
     list: () => http.get<{ data: T.Import[] }>("/v1/imports"),
     get: (id: string) => http.get<T.Import>(`/v1/imports/${id}`),

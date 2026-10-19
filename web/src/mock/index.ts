@@ -23,6 +23,7 @@ import { registerLabels } from "./handlers/labels";
 import { applyMockImap, syncReceiving } from "./handlers/mailhost";
 import { registerMcp } from "./handlers/mcp";
 import { registerNotificationPrefs } from "./handlers/notificationPrefs";
+import { registerSupportChannels } from "./handlers/supportChannels";
 import { registerResources } from "./handlers/resources";
 import { registerTickets } from "./handlers/tickets";
 import { registerWorkspace } from "./handlers/workspace";
@@ -79,6 +80,7 @@ export function installMock(): void {
   registerAiClients();
   registerBots();
   registerNotificationPrefs();
+  registerSupportChannels();
 
   setTransport((input, init) => dispatch(input, init));
   setSocketFactory(socketFactory);

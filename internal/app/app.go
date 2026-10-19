@@ -51,6 +51,7 @@ import (
 	"github.com/useopendesk/opendesk/internal/plan"
 	"github.com/useopendesk/opendesk/internal/push"
 	"github.com/useopendesk/opendesk/internal/storage"
+	"github.com/useopendesk/opendesk/internal/supportchannels"
 	"github.com/useopendesk/opendesk/internal/version"
 	"github.com/useopendesk/opendesk/internal/webui"
 )
@@ -69,6 +70,7 @@ var areas = []area{
 	{billing.Register, billing.RegisterWorkers, billing.Periodic, billing.Background},
 	{ai.Register, ai.RegisterWorkers, ai.Periodic, ai.Background},
 	{integrations.Register, integrations.RegisterWorkers, integrations.Periodic, integrations.Background},
+	{supportchannels.Register, supportchannels.RegisterWorkers, supportchannels.Periodic, supportchannels.Background},
 	{assistant.Register, assistant.RegisterWorkers, assistant.Periodic, assistant.Background},
 	{knowledge.Register, knowledge.RegisterWorkers, knowledge.Periodic, knowledge.Background},
 	{bots.Register, bots.RegisterWorkers, bots.Periodic, bots.Background},

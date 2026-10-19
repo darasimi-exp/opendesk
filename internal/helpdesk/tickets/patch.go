@@ -530,6 +530,17 @@ func applyPatch(ctx context.Context, tx pgx.Tx, d *deps.Deps, wid, tid uuid.UUID
 	return changes, nil
 }
 
+// ApplyPatch applies a person-initiated ticket change. It runs the same
+// validation, events, notifications, CSAT and automation triggers as PATCH
+// /v1/tickets/{id}.
+func ApplyPatch(ctx context.Context, tx pgx.Tx, d *deps.Deps, principal *auth.Principal, tid uuid.UUID, patch Patch) ([]string, error) {
+	if err := patch.checkCaller(ctx, tx, principal, tid); err != nil {
+		return nil, err
+	}
+	return applyPatch(ctx, tx, d, principal.WorkspaceID, tid, actorOf(principal), patch,
+		applyOpts{Enqueue: true, RequireFields: true})
+}
+
 // closing reports a solved or closed status.
 func closing(status string) bool {
 	return status == domain.StatusSolved || status == domain.StatusClosed

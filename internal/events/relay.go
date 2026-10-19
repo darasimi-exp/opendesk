@@ -3,10 +3,10 @@ package events
 import (
 	"context"
 	"encoding/json"
-	"github.com/google/uuid"
 	"log/slog"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nats-io/nats.go"
@@ -106,6 +106,11 @@ func (r *Relay) flush(ctx context.Context) (int, error) {
 				Args:       jobs.WebhookDispatchArgs{WorkspaceID: e.WorkspaceID, EventSeq: e.Seq},
 				InsertOpts: &river.InsertOpts{Queue: jobs.QueueWebhooks},
 			})
+			if supportChannelEvent(e.Type) {
+				params = append(params, river.InsertManyParams{Args: jobs.SupportChannelDispatchArgs{
+					WorkspaceID: e.WorkspaceID, EventSeq: e.Seq,
+				}})
+			}
 			if _, err := tx.Exec(ctx, `UPDATE events SET published_at = now() WHERE workspace_id = $1 AND seq = $2`, e.WorkspaceID, e.Seq); err != nil {
 				return err
 			}
@@ -120,6 +125,15 @@ func (r *Relay) flush(ctx context.Context) (int, error) {
 		return nil
 	})
 	return n, err
+}
+
+func supportChannelEvent(typ string) bool {
+	switch typ {
+	case "ticket.created", "ticket.updated", "message.created":
+		return true
+	default:
+		return false
+	}
 }
 
 // Disconnect asks the gateway to close a user's sockets (all, or one session's).

@@ -100,6 +100,24 @@ type WebhookDeliverArgs struct {
 
 func (WebhookDeliverArgs) Kind() string { return "webhooks.deliver" }
 
+// SupportChannelDispatchArgs mirrors one committed ticket event to configured
+// agent-facing channels. Owner: supportchannels.
+type SupportChannelDispatchArgs struct {
+	WorkspaceID uuid.UUID `json:"workspace_id"`
+	EventSeq    int64     `json:"event_seq"`
+}
+
+func (SupportChannelDispatchArgs) Kind() string { return "support_channels.dispatch" }
+
+// SupportChannelInboundArgs applies one verified, deduplicated provider event.
+// Owner: supportchannels.
+type SupportChannelInboundArgs struct {
+	ConnectionID    uuid.UUID `json:"connection_id"`
+	ExternalEventID string    `json:"external_event_id"`
+}
+
+func (SupportChannelInboundArgs) Kind() string { return "support_channels.inbound" }
+
 // SystemEmailArgs sends platform email (verification, reset, invites, notifications)
 // through the system mailer. Owner: core.
 type SystemEmailArgs struct {

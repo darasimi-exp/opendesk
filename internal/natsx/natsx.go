@@ -61,6 +61,16 @@ func Connect(o Options, log *slog.Logger) (*Conn, error) {
 		if err != nil {
 			return nil, fmt.Errorf("NATS_LISTEN port: %w", err)
 		}
+		// NATS opens its listener asynchronously in Start. Check the address first
+		// so local startup reports the real bind failure instead of timing out with
+		// the otherwise opaque "embedded nats did not start" message.
+		probe, err := net.Listen("tcp", o.Listen)
+		if err != nil {
+			return nil, fmt.Errorf("NATS_LISTEN %s: %w", o.Listen, err)
+		}
+		if err := probe.Close(); err != nil {
+			return nil, fmt.Errorf("NATS_LISTEN %s: close probe: %w", o.Listen, err)
+		}
 		sopts.Host, sopts.Port = host, p
 	}
 	ns, err := server.NewServer(sopts)

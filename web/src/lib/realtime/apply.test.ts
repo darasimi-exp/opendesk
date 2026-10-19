@@ -1,6 +1,6 @@
 import { QueryClient } from "@tanstack/react-query";
 import { describe, expect, it, vi } from "vitest";
-import type { Member, User, Workspace } from "../api/types";
+import type { Member, SupportChannelConnection, SupportChannelDestination, User, Workspace } from "../api/types";
 import { qk } from "../queries";
 import { useSession } from "../session";
 import { env } from "../test/fixtures";
@@ -40,5 +40,28 @@ describe("picture and workspace events", () => {
     applyEnvelope(qc, env(3, { type: "workspace.updated", data: { workspace: w } }), { me: "u1" });
     expect(qc.getQueryData<Workspace>(qk.workspace)?.avatar_url).toBe(w.avatar_url);
     expect(useSession.getState().memberships[0].workspace.avatar_url).toBe(w.avatar_url);
+  });
+});
+
+describe("support channel events", () => {
+  it("keeps connection and destination lists current", () => {
+    const qc = new QueryClient();
+    qc.setQueryData(qk.supportChannelConnections, []);
+    qc.setQueryData(qk.supportChannelDestinations, []);
+    const connection = { id: "c1", provider: "slack", name: "Support" } as SupportChannelConnection;
+    const destination = { id: "d1", connection_id: "c1", external_channel_id: "C1" } as SupportChannelDestination;
+
+    applyEnvelope(qc, env(4, { type: "support_channel_connection.created", data: { support_channel_connection: connection } }), { me: "u1" });
+    applyEnvelope(qc, env(5, { type: "support_channel_destination.created", data: { support_channel_destination: destination } }), { me: "u1" });
+    expect(qc.getQueryData<SupportChannelConnection[]>(qk.supportChannelConnections)).toEqual([connection]);
+    expect(qc.getQueryData<SupportChannelDestination[]>(qk.supportChannelDestinations)).toEqual([destination]);
+
+    applyEnvelope(qc, env(6, { type: "support_channel_connection.deleted", data: { support_channel_connection_id: "c1" } }), { me: "u1" });
+    expect(qc.getQueryData<SupportChannelConnection[]>(qk.supportChannelConnections)).toEqual([]);
+    expect(qc.getQueryData<SupportChannelDestination[]>(qk.supportChannelDestinations)).toEqual([]);
+
+    applyEnvelope(qc, env(7, { type: "support_channel_destination.created", data: { support_channel_destination: destination } }), { me: "u1" });
+    applyEnvelope(qc, env(8, { type: "support_channel_destination.deleted", data: { support_channel_destination_id: "d1" } }), { me: "u1" });
+    expect(qc.getQueryData<SupportChannelDestination[]>(qk.supportChannelDestinations)).toEqual([]);
   });
 });

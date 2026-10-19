@@ -25,8 +25,10 @@ import (
 	"github.com/useopendesk/opendesk/internal/integrations"
 )
 
-// MessageInput is the body of POST /v1/assistant/sessions/{id}/messages.
-type MessageInput struct {
+// AssistantMessageInput is the body of POST /v1/assistant/sessions/{id}/messages.
+// The explicit name also keeps its generated OpenAPI schema distinct from the
+// helpdesk ticket message input registered on the same Huma API.
+type AssistantMessageInput struct {
 	Text    string       `json:"text" minLength:"1" maxLength:"8000"`
 	Context *PageContext `json:"context,omitempty"`
 }
@@ -195,7 +197,7 @@ func (s *Service) streamMessage(w http.ResponseWriter, r *http.Request, id strin
 		es.fail(httpx.NotFound("Conversation"))
 		return
 	}
-	var in MessageInput
+	var in AssistantMessageInput
 	if err := readBody(r, &in); err != nil {
 		es.fail(err)
 		return
@@ -228,7 +230,7 @@ func (s *Service) newRun(ctx context.Context, p *auth.Principal, page *PageConte
 	return &runCtx{svc: s, p: p, read: newCaller(s.api, p, false), page: page}
 }
 
-func (s *Service) sendMessage(ctx context.Context, sid uuid.UUID, in MessageInput, emit emitFn) error {
+func (s *Service) sendMessage(ctx context.Context, sid uuid.UUID, in AssistantMessageInput, emit emitFn) error {
 	p, err := s.require(ctx)
 	if err != nil {
 		return err

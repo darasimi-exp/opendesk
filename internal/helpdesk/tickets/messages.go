@@ -21,7 +21,11 @@ import (
 	"github.com/useopendesk/opendesk/internal/templates"
 )
 
-type ticketMessageBody struct {
+// MessageInput is a reply or note written through any trusted agent surface: the
+// REST API, a support-channel adapter, or a future native client. PostMessage owns
+// the shared validation and delivery behavior; callers must first authorize the
+// principal for the ticket with domain.LoadVisibleTicket.
+type MessageInput struct {
 	Kind          string   `json:"kind" enum:"reply,note"`
 	BodyHTML      string   `json:"body_html" maxLength:"500000"`
 	Cc            []string `json:"cc,omitempty" maxItems:"20"`
@@ -94,7 +98,7 @@ func registerMessages(d *deps.Deps, api huma.API) {
 		Summary: "Reply or add a note", Tags: tags, DefaultStatus: http.StatusCreated},
 		func(ctx context.Context, in *struct {
 			ID   string `path:"id"`
-			Body ticketMessageBody
+			Body MessageInput
 		}) (*struct{ Body domain.Message }, error) {
 			p, err := auth.RequireWorkspace(ctx, auth.RoleAgent, auth.ScopeTicketsWrite)
 			if err != nil {
@@ -106,7 +110,7 @@ func registerMessages(d *deps.Deps, api huma.API) {
 				if err != nil {
 					return err
 				}
-				msg, err = postMessage(ctx, tx, d, p, id, in.Body)
+				msg, err = PostMessage(ctx, tx, d, p, id, in.Body)
 				return err
 			})
 			if err != nil {
@@ -195,8 +199,8 @@ func registerMessages(d *deps.Deps, api huma.API) {
 		})
 }
 
-// postMessage adds an agent or API reply or note and applies an optional status.
-func postMessage(ctx context.Context, tx pgx.Tx, d *deps.Deps, p *auth.Principal, tid uuid.UUID, b ticketMessageBody) (domain.Message, error) {
+// PostMessage adds an agent or API reply or note and applies an optional status.
+func PostMessage(ctx context.Context, tx pgx.Tx, d *deps.Deps, p *auth.Principal, tid uuid.UUID, b MessageInput) (domain.Message, error) {
 	wid := p.WorkspaceID
 	actor := actorOf(p)
 	var channel, subject string
