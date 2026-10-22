@@ -67,7 +67,7 @@ func (a Adapter) Health(ctx context.Context, c *http.Client, cr map[string]strin
 	if _, err := a.Validate(ctx, c, cr); err != nil {
 		return channel.Health{}, err
 	}
-	return channel.Health{Status: "action_required", Detail: "Credentials work. Verify the Events API and /opendesk request URLs in Slack."}, nil
+	return channel.Health{Status: "action_required", Detail: "Credentials work. Verify the Events API, interactivity and /opendesk request URLs in Slack."}, nil
 }
 
 func (a Adapter) endpoint(path string) string {
@@ -144,6 +144,66 @@ func (Adapter) Parse(h http.Header, body []byte) (channel.WebhookResult, error) 
 		v, err := url.ParseQuery(string(body))
 		if err != nil {
 			return channel.WebhookResult{}, err
+		}
+		if payload := v.Get("payload"); payload != "" {
+			var x struct {
+				TriggerID string `json:"trigger_id"`
+				Team      struct {
+					ID string `json:"id"`
+				} `json:"team"`
+				User struct {
+					ID string `json:"id"`
+				} `json:"user"`
+				Channel struct {
+					ID string `json:"id"`
+				} `json:"channel"`
+				Message struct {
+					TS       string `json:"ts"`
+					ThreadTS string `json:"thread_ts"`
+				} `json:"message"`
+				Container struct {
+					MessageTS string `json:"message_ts"`
+					ThreadTS  string `json:"thread_ts"`
+				} `json:"container"`
+				Actions []struct {
+					ActionID string `json:"action_id"`
+					Value    string `json:"value"`
+					Selected *struct {
+						Value string `json:"value"`
+					} `json:"selected_option"`
+				} `json:"actions"`
+			}
+			if err := json.Unmarshal([]byte(payload), &x); err != nil {
+				return channel.WebhookResult{}, err
+			}
+			if len(x.Actions) == 0 {
+				return channel.WebhookResult{}, nil
+			}
+			action := x.Actions[0]
+			cmd := strings.TrimPrefix(action.ActionID, "opendesk:")
+			value := action.Value
+			if action.Selected != nil {
+				value = action.Selected.Value
+			}
+			text := value
+			if cmd == "confirm" || cmd == "cancel" {
+				text, cmd = cmd, "chat"
+			}
+			thread := x.Container.ThreadTS
+			if thread == "" {
+				thread = x.Message.ThreadTS
+			}
+			if thread == "" {
+				thread = x.Container.MessageTS
+			}
+			if thread == "" {
+				thread = x.Message.TS
+			}
+			return channel.WebhookResult{Events: []channel.Inbound{{
+				EventID: x.TriggerID, AccountID: x.Team.ID, ExternalChannelID: x.Channel.ID,
+				ExternalThreadID: thread, ExternalUserID: x.User.ID, Command: cmd, Text: text,
+				Value: value, SourceMessageID: x.Container.MessageTS,
+			}}}, nil
 		}
 		// Slash commands never carry a thread, so they name the ticket by number,
 		// like `/opendesk 123 status solved`.
@@ -248,7 +308,8 @@ func (a Adapter) CreateThread(ctx context.Context, c *http.Client, cr map[string
 	var out struct {
 		TS string `json:"ts"`
 	}
-	if err := a.call(ctx, c, cr["bot_token"], "chat.postMessage", map[string]any{"channel": destination, "text": render(t), "unfurl_links": false, "unfurl_media": false}, &out); err != nil {
+	msg := ticketPayload(destination, "", t)
+	if err := a.call(ctx, c, cr["bot_token"], "chat.postMessage", msg, &out); err != nil {
 		return channel.Thread{}, err
 	}
 	return channel.Thread{ID: out.TS, RootID: out.TS}, nil
@@ -261,7 +322,77 @@ func (a Adapter) Post(ctx context.Context, c *http.Client, cr map[string]string,
 	return a.call(ctx, c, cr["bot_token"], "chat.postMessage", msg, nil)
 }
 func (a Adapter) Update(ctx context.Context, c *http.Client, cr map[string]string, root string, t channel.Ticket) error {
-	return a.call(ctx, c, cr["bot_token"], "chat.update", map[string]any{"channel": cr["channel_id"], "ts": root, "text": render(t)}, nil)
+	return a.call(ctx, c, cr["bot_token"], "chat.update", ticketPayload(cr["channel_id"], root, t), nil)
+}
+
+func (a Adapter) PostInteractive(ctx context.Context, c *http.Client, cr map[string]string, thread string, message channel.Message) (channel.MessageRef, error) {
+	var out struct {
+		TS string `json:"ts"`
+	}
+	payload := interactivePayload(cr["channel_id"], "", thread, message)
+	err := a.call(ctx, c, cr["bot_token"], "chat.postMessage", payload, &out)
+	return channel.MessageRef{ID: out.TS}, err
+}
+
+func (a Adapter) UpdateInteractive(ctx context.Context, c *http.Client, cr map[string]string, messageID string, message channel.Message) error {
+	return a.call(ctx, c, cr["bot_token"], "chat.update", interactivePayload(cr["channel_id"], messageID, "", message), nil)
+}
+
+func ticketPayload(channelID, root string, t channel.Ticket) map[string]any {
+	payload := map[string]any{
+		"channel": channelID, "text": render(t), "unfurl_links": false, "unfurl_media": false,
+		"blocks": []any{
+			map[string]any{"type": "header", "text": map[string]string{"type": "plain_text", "text": fmt.Sprintf("#%d %s", t.Number, clipText(t.Subject, 120))}},
+			map[string]any{"type": "section", "fields": []any{
+				map[string]string{"type": "mrkdwn", "text": "*Customer*\n" + slackText(t.Customer)},
+				map[string]string{"type": "mrkdwn", "text": "*Assignee*\n" + slackText(t.Assignee)},
+				map[string]string{"type": "mrkdwn", "text": "*Status*\n" + slackText(strings.ReplaceAll(t.Status, "_", " "))},
+				map[string]string{"type": "mrkdwn", "text": "*Priority*\n" + slackText(t.Priority)},
+			}},
+			map[string]any{"type": "actions", "elements": []any{
+				map[string]any{"type": "button", "text": map[string]string{"type": "plain_text", "text": "Assign to me"}, "action_id": "opendesk:assign_self"},
+				selectElement("Status", "opendesk:status", []string{"open", "pending", "on_hold", "solved", "closed"}),
+				selectElement("Priority", "opendesk:priority", []string{"low", "normal", "high", "urgent"}),
+				map[string]any{"type": "button", "text": map[string]string{"type": "plain_text", "text": "Open in opendesk"}, "url": t.URL},
+			}},
+		},
+	}
+	if root != "" {
+		payload["ts"] = root
+	}
+	return payload
+}
+
+func selectElement(label, actionID string, values []string) map[string]any {
+	options := make([]any, 0, len(values))
+	for _, value := range values {
+		options = append(options, map[string]any{"text": map[string]string{"type": "plain_text", "text": strings.ReplaceAll(value, "_", " ")}, "value": value})
+	}
+	return map[string]any{"type": "static_select", "placeholder": map[string]string{"type": "plain_text", "text": label}, "action_id": actionID, "options": options}
+}
+
+func interactivePayload(channelID, messageID, thread string, message channel.Message) map[string]any {
+	payload := map[string]any{"channel": channelID, "text": slackText(message.Text), "unfurl_links": false, "unfurl_media": false}
+	if messageID != "" {
+		payload["ts"] = messageID
+	}
+	if thread != "" {
+		payload["thread_ts"] = thread
+	}
+	blocks := []any{map[string]any{"type": "section", "text": map[string]string{"type": "mrkdwn", "text": slackText(message.Text)}}}
+	if len(message.Actions) > 0 {
+		elements := make([]any, 0, len(message.Actions))
+		for _, action := range message.Actions {
+			button := map[string]any{"type": "button", "text": map[string]string{"type": "plain_text", "text": action.Label}, "action_id": "opendesk:" + action.Command, "value": action.Value}
+			if action.Style == "primary" || action.Style == "danger" {
+				button["style"] = action.Style
+			}
+			elements = append(elements, button)
+		}
+		blocks = append(blocks, map[string]any{"type": "actions", "elements": elements})
+	}
+	payload["blocks"] = blocks
+	return payload
 }
 func render(t channel.Ticket) string {
 	return fmt.Sprintf("*#%d %s*\n%s · %s · %s\n%s", t.Number, slackText(t.Subject), slackText(t.Customer), slackText(t.Status), slackText(t.Priority), slackText(t.URL))
@@ -273,4 +404,12 @@ func slackText(s string) string {
 	s = strings.ReplaceAll(s, "&", "&amp;")
 	s = strings.ReplaceAll(s, "<", "&lt;")
 	return strings.ReplaceAll(s, ">", "&gt;")
+}
+
+func clipText(s string, n int) string {
+	r := []rune(s)
+	if len(r) > n {
+		return string(r[:n]) + "…"
+	}
+	return s
 }

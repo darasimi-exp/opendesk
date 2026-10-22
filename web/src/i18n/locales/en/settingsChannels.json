@@ -598,10 +598,11 @@
     "provider": {
       "slack": {
         "description": "Mirror email tickets into Slack threads and work them by talking to Ollie.",
-        "setup": "Create a Slack app with the chat:write, app_mentions:read, channels:read and groups:read bot scopes, install it, then paste its bot token and signing secret. After connecting, opendesk shows the two settings to finish in Slack.",
+        "setup": "Create a Slack app with the chat:write, app_mentions:read, channels:read and groups:read bot scopes, install it, then paste its bot token and signing secret. After connecting, opendesk shows the setup steps to finish in Slack.",
         "steps": [
           "In your Slack app, open Event Subscriptions, turn it on and paste the address above as the Request URL.",
           "Under Subscribe to bot events, add app_mention and save.",
+          "Open Interactivity & Shortcuts, turn it on and use the same address as its Request URL.",
           "Open Slash Commands, create /opendesk and use the same address as its Request URL.",
           "Invite the bot to each channel you route tickets to: /invite @your-bot."
         ],

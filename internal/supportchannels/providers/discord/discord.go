@@ -227,8 +227,9 @@ func (Adapter) Parse(_ http.Header, body []byte) (channel.WebhookResult, error) 
 			User struct{ ID string } `json:"user"`
 		} `json:"member"`
 		Data struct {
-			Name     string `json:"name"`
-			CustomID string `json:"custom_id"`
+			Name     string   `json:"name"`
+			CustomID string   `json:"custom_id"`
+			Values   []string `json:"values"`
 			Options  []struct {
 				Name  string
 				Value any
@@ -256,14 +257,24 @@ func (Adapter) Parse(_ http.Header, body []byte) (channel.WebhookResult, error) 
 			cmd = fmt.Sprint(o.Value)
 		}
 	}
+	if len(x.Data.Values) > 0 {
+		text = x.Data.Values[0]
+	}
 	if cmd == "ask" || cmd == "chat" {
 		cmd = "chat"
 	}
+	if cmd == "confirm" || cmd == "cancel" {
+		text, cmd = cmd, "chat"
+	}
+	responseBody := []byte(`{"type":4,"data":{"content":"Command received.","flags":64}}`)
+	if x.Type == 3 {
+		responseBody = []byte(`{"type":6}`)
+	}
 	return channel.WebhookResult{
-		Events:      []channel.Inbound{{EventID: x.ID, AccountID: x.GuildID, ExternalChannelID: x.ChannelID, ExternalThreadID: x.ChannelID, ExternalUserID: x.Member.User.ID, Command: cmd, Text: text, Value: text, Directed: true}},
+		Events:      []channel.Inbound{{EventID: x.ID, AccountID: x.GuildID, ExternalChannelID: x.ChannelID, ExternalThreadID: x.ChannelID, ExternalUserID: x.Member.User.ID, Command: cmd, Text: text, Value: text, Directed: true, SourceMessageID: x.Message.ID}},
 		Status:      http.StatusOK,
 		ContentType: "application/json",
-		Body:        []byte(`{"type":4,"data":{"content":"Command received.","flags":64}}`),
+		Body:        responseBody,
 	}, nil
 }
 func (a Adapter) CreateThread(ctx context.Context, c *http.Client, cr map[string]string, destination string, t channel.Ticket) (channel.Thread, error) {
@@ -275,10 +286,13 @@ func (a Adapter) CreateThread(ctx context.Context, c *http.Client, cr map[string
 	if err := a.call(ctx, c, cr["bot_token"], http.MethodPost, "/channels/"+destination+"/threads", map[string]any{"name": name, "type": 11, "auto_archive_duration": 1440}, &th); err != nil {
 		return channel.Thread{}, err
 	}
-	if err := a.Post(ctx, c, cr, th.ID, render(t)); err != nil {
+	var root struct {
+		ID string `json:"id"`
+	}
+	if err := a.call(ctx, c, cr["bot_token"], http.MethodPost, "/channels/"+th.ID+"/messages", ticketPayload(t), &root); err != nil {
 		return channel.Thread{}, err
 	}
-	return channel.Thread{ID: th.ID, ChannelID: th.ID}, nil
+	return channel.Thread{ID: th.ID, RootID: root.ID, ChannelID: th.ID}, nil
 }
 func (a Adapter) Post(ctx context.Context, c *http.Client, cr map[string]string, thread, text string) error {
 	if thread == "" {
@@ -288,8 +302,71 @@ func (a Adapter) Post(ctx context.Context, c *http.Client, cr map[string]string,
 		"content": clip(text, 1900), "allowed_mentions": map[string]any{"parse": []string{}}, "flags": 4,
 	}, nil)
 }
-func (a Adapter) Update(context.Context, *http.Client, map[string]string, string, channel.Ticket) error {
-	return nil
+func (a Adapter) Update(ctx context.Context, c *http.Client, cr map[string]string, root string, t channel.Ticket) error {
+	return a.call(ctx, c, cr["bot_token"], http.MethodPatch, "/channels/"+cr["channel_id"]+"/messages/"+root, ticketPayload(t), nil)
+}
+
+func (a Adapter) PostInteractive(ctx context.Context, c *http.Client, cr map[string]string, thread string, message channel.Message) (channel.MessageRef, error) {
+	if thread == "" {
+		thread = cr["channel_id"]
+	}
+	var out struct {
+		ID string `json:"id"`
+	}
+	err := a.call(ctx, c, cr["bot_token"], http.MethodPost, "/channels/"+thread+"/messages", interactivePayload(message), &out)
+	return channel.MessageRef{ID: out.ID}, err
+}
+
+func (a Adapter) UpdateInteractive(ctx context.Context, c *http.Client, cr map[string]string, messageID string, message channel.Message) error {
+	return a.call(ctx, c, cr["bot_token"], http.MethodPatch, "/channels/"+cr["channel_id"]+"/messages/"+messageID, interactivePayload(message), nil)
+}
+
+func ticketPayload(t channel.Ticket) map[string]any {
+	return map[string]any{
+		"content": "", "allowed_mentions": map[string]any{"parse": []string{}},
+		"embeds": []any{map[string]any{
+			"title": fmt.Sprintf("#%d %s", t.Number, clip(t.Subject, 220)), "url": t.URL,
+			"description": fmt.Sprintf("**Customer**\n%s\n\n**Assignee**\n%s", clip(t.Customer, 300), clip(t.Assignee, 300)),
+			"fields": []any{
+				map[string]any{"name": "Status", "value": strings.ReplaceAll(t.Status, "_", " "), "inline": true},
+				map[string]any{"name": "Priority", "value": t.Priority, "inline": true},
+			},
+		}},
+		"components": []any{
+			map[string]any{"type": 1, "components": []any{
+				map[string]any{"type": 2, "style": 1, "label": "Assign to me", "custom_id": "opendesk:assign_self"},
+				map[string]any{"type": 2, "style": 5, "label": "Open in opendesk", "url": t.URL},
+			}},
+			map[string]any{"type": 1, "components": []any{discordSelect("Status", "opendesk:status", []string{"open", "pending", "on_hold", "solved", "closed"})}},
+			map[string]any{"type": 1, "components": []any{discordSelect("Priority", "opendesk:priority", []string{"low", "normal", "high", "urgent"})}},
+		},
+	}
+}
+
+func discordSelect(label, id string, values []string) map[string]any {
+	options := make([]any, 0, len(values))
+	for _, value := range values {
+		options = append(options, map[string]any{"label": strings.ReplaceAll(value, "_", " "), "value": value})
+	}
+	return map[string]any{"type": 3, "custom_id": id, "placeholder": label, "options": options}
+}
+
+func interactivePayload(message channel.Message) map[string]any {
+	payload := map[string]any{"content": clip(message.Text, 1900), "allowed_mentions": map[string]any{"parse": []string{}}, "components": []any{}}
+	if len(message.Actions) > 0 {
+		buttons := make([]any, 0, len(message.Actions))
+		for _, action := range message.Actions {
+			style := 2
+			if action.Style == "primary" {
+				style = 3
+			} else if action.Style == "danger" {
+				style = 4
+			}
+			buttons = append(buttons, map[string]any{"type": 2, "style": style, "label": action.Label, "custom_id": "opendesk:" + action.Command})
+		}
+		payload["components"] = []any{map[string]any{"type": 1, "components": buttons}}
+	}
+	return payload
 }
 
 func render(t channel.Ticket) string {

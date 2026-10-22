@@ -45,6 +45,7 @@ type conversationAction struct {
 	Value       string `json:"value,omitempty"`
 	Subject     string `json:"subject,omitempty"`
 	Description string `json:"description,omitempty"`
+	Direct      bool   `json:"direct,omitempty"`
 }
 
 type conversationTarget struct {
@@ -58,27 +59,27 @@ type conversationState struct {
 	PendingExpires *time.Time
 }
 
-func (s *Service) converse(ctx context.Context, p *auth.Principal, connectionID, tid uuid.UUID, includeNotes bool, in channel.Inbound) (string, error) {
+func (s *Service) converse(ctx context.Context, p *auth.Principal, connectionID, tid uuid.UUID, includeNotes bool, in channel.Inbound) (channel.Message, error) {
 	return s.converseWithTarget(ctx, p, connectionID, conversationTarget{TicketID: &tid}, includeNotes, in)
 }
 
-func (s *Service) converseCreate(ctx context.Context, p *auth.Principal, connectionID uuid.UUID, teamID *uuid.UUID, in channel.Inbound) (string, error) {
+func (s *Service) converseCreate(ctx context.Context, p *auth.Principal, connectionID uuid.UUID, teamID *uuid.UUID, in channel.Inbound) (channel.Message, error) {
 	return s.converseWithTarget(ctx, p, connectionID, conversationTarget{TeamID: teamID}, false, in)
 }
 
-func (s *Service) converseWithTarget(ctx context.Context, p *auth.Principal, connectionID uuid.UUID, target conversationTarget, includeNotes bool, in channel.Inbound) (string, error) {
+func (s *Service) converseWithTarget(ctx context.Context, p *auth.Principal, connectionID uuid.UUID, target conversationTarget, includeNotes bool, in channel.Inbound) (channel.Message, error) {
 	processingID := uuid.New()
 	state, err := s.claimConversation(ctx, p.WorkspaceID, connectionID, processingID, in)
 	if err != nil {
-		return "", err
+		return channel.Message{}, err
 	}
 	defer s.releaseConversation(connectionID, processingID, in)
 	input := strings.TrimSpace(in.Text)
 	if input == "" {
 		if target.TicketID == nil {
-			return "Tell me the subject and a short description of the ticket you want to create.", nil
+			return plainChannelMessage("Tell me the subject and a short description of the ticket you want to create."), nil
 		}
-		return "What would you like me to do with this ticket?", nil
+		return plainChannelMessage("What would you like me to do with this ticket?"), nil
 	}
 	if state.Pending != nil && state.PendingExpires != nil && time.Now().Before(*state.PendingExpires) {
 		switch confirmation(input) {
@@ -87,7 +88,7 @@ func (s *Service) converseWithTarget(ctx context.Context, p *auth.Principal, con
 			state.Pending, state.PendingExpires = nil, nil
 			answer, err := s.applyAndSaveConversation(ctx, p, connectionID, processingID, target, in, action, state, true)
 			if errors.Is(err, errPendingActionGone) {
-				return "There isn't a change waiting for confirmation.", nil
+				return plainChannelMessage("There isn't a change waiting for confirmation."), nil
 			}
 			return answer, err
 		case "cancel":
@@ -97,9 +98,9 @@ func (s *Service) converseWithTarget(ctx context.Context, p *auth.Principal, con
 			}
 			state.Pending, state.PendingExpires = nil, nil
 			state.Turns = appendTurns(state.Turns, input, answer)
-			return answer, s.saveConversation(ctx, p.WorkspaceID, connectionID, processingID, in, state)
+			return plainChannelMessage(answer), s.saveConversation(ctx, p.WorkspaceID, connectionID, processingID, in, state)
 		default:
-			return "I still have a change waiting. Reply `confirm` to apply it or `cancel` to discard it.", nil
+			return confirmationChannelMessage("I still have a change waiting. Reply `confirm` to apply it or `cancel` to discard it."), nil
 		}
 	}
 	state.Pending, state.PendingExpires = nil, nil
@@ -107,13 +108,13 @@ func (s *Service) converseWithTarget(ctx context.Context, p *auth.Principal, con
 	settings, err := s.ai.WorkspaceAI(ctx, p.WorkspaceID)
 	if err != nil || !settings.Assistant {
 		if target.TicketID == nil {
-			return "Ollie isn't available for this workspace. Create the ticket in opendesk instead.", nil
+			return plainChannelMessage("Ollie isn't available for this workspace. Create the ticket in opendesk instead."), nil
 		}
-		return "Ollie isn't available for this workspace. You can still use reply, note, assign, status and priority commands.", nil
+		return plainChannelMessage("Ollie isn't available for this workspace. You can still use reply, note, assign, status and priority commands."), nil
 	}
 	action, answer, err := s.interpretConversation(ctx, p, target, includeNotes, state.Turns, input)
 	if err != nil {
-		return "", fmt.Errorf("%w: %v", errConversationUnavailable, err)
+		return channel.Message{}, fmt.Errorf("%w: %v", errConversationUnavailable, err)
 	}
 	if action != nil {
 		if needsConfirmation(*action) {
@@ -129,7 +130,47 @@ func (s *Service) converseWithTarget(ctx context.Context, p *auth.Principal, con
 	}
 	answer = clip(answer, 3500)
 	state.Turns = appendTurns(state.Turns, input, answer)
-	return answer, s.saveConversation(ctx, p.WorkspaceID, connectionID, processingID, in, state)
+	message := plainChannelMessage(answer)
+	if state.Pending != nil {
+		message = confirmationChannelMessage(answer)
+	}
+	return message, s.saveConversation(ctx, p.WorkspaceID, connectionID, processingID, in, state)
+}
+
+// previewExplicit gives consequential text commands the same durable preview
+// and one-time confirmation path as Ollie's typed actions.
+func (s *Service) previewExplicit(ctx context.Context, p *auth.Principal, connectionID, ticketID uuid.UUID, in channel.Inbound) (channel.Message, error) {
+	processingID := uuid.New()
+	state, err := s.claimConversation(ctx, p.WorkspaceID, connectionID, processingID, in)
+	if err != nil {
+		return channel.Message{}, err
+	}
+	defer s.releaseConversation(connectionID, processingID, in)
+	action := conversationAction{Command: in.Command, Text: strings.TrimSpace(in.Text), Value: strings.TrimSpace(in.Value), Direct: true}
+	if action.Command == "reply" && action.Text == "" {
+		return channel.Message{}, httpx.Validation("Message text is required.")
+	}
+	if action.Command == "status" && action.Value != domain.StatusClosed {
+		return channel.Message{}, httpx.Validation("Only closing a ticket needs a preview.")
+	}
+	now := time.Now().Add(pendingActionTTL)
+	state.Pending, state.PendingExpires = &action, &now
+	answer := actionConfirmation(action)
+	state.Turns = appendTurns(state.Turns, in.Text, answer)
+	if err := s.saveConversation(ctx, p.WorkspaceID, connectionID, processingID, in, state); err != nil {
+		return channel.Message{}, err
+	}
+	_ = ticketID // the conversation key is the mapped ticket thread; visibility was checked by the caller.
+	return confirmationChannelMessage(answer), nil
+}
+
+func plainChannelMessage(text string) channel.Message { return channel.Message{Text: clip(text, 3500)} }
+
+func confirmationChannelMessage(text string) channel.Message {
+	return channel.Message{Text: clip(text, 3500), Actions: []channel.Action{
+		{Command: "confirm", Label: "Confirm", Style: "primary"},
+		{Command: "cancel", Label: "Cancel", Style: "danger"},
+	}}
 }
 
 func (s *Service) interpretConversation(ctx context.Context, p *auth.Principal, target conversationTarget, includeNotes bool, history []conversationTurn, input string) (*conversationAction, string, error) {
@@ -419,7 +460,7 @@ func (s *Service) saveConversationWith(ctx context.Context, q db.Querier, wid, c
 	return err
 }
 
-func (s *Service) applyAndSaveConversation(ctx context.Context, p *auth.Principal, connectionID, processingID uuid.UUID, target conversationTarget, in channel.Inbound, action conversationAction, state conversationState, requirePending bool) (string, error) {
+func (s *Service) applyAndSaveConversation(ctx context.Context, p *auth.Principal, connectionID, processingID uuid.UUID, target conversationTarget, in channel.Inbound, action conversationAction, state conversationState, requirePending bool) (channel.Message, error) {
 	var answer string
 	err := s.d.DB.Tx(ctx, func(tx pgx.Tx) error {
 		if requirePending {
@@ -438,11 +479,10 @@ func (s *Service) applyAndSaveConversation(ctx context.Context, p *auth.Principa
 				return errPendingActionGone
 			}
 		}
-		// Ollie chose this change and the agent asked for it, so it runs with the
-		// agent's role and checks and is attributed to Ollie on their behalf, like
-		// every other assistant action (auth.Principal.Assistant).
+		// Model-selected changes are attributed to Ollie on the agent's behalf.
+		// Explicit commands remain the linked agent's own action.
 		ollie := *p
-		ollie.Assistant = true
+		ollie.Assistant = !action.Direct
 		if action.Command == "create_ticket" {
 			body := ""
 			if action.Description != "" {
@@ -466,7 +506,7 @@ func (s *Service) applyAndSaveConversation(ctx context.Context, p *auth.Principa
 		state.Turns = appendTurns(state.Turns, in.Text, answer)
 		return s.saveConversationWith(ctx, tx, p.WorkspaceID, connectionID, processingID, in, state)
 	})
-	return answer, err
+	return plainChannelMessage(answer), err
 }
 
 func (s *Service) releaseConversation(connectionID, processingID uuid.UUID, in channel.Inbound) {

@@ -42,6 +42,8 @@ type inboundWorker struct {
 	s *Service
 }
 
+var errTicketCommandBusy = errors.New("an earlier support channel command is still processing")
+
 func (w *inboundWorker) Timeout(*river.Job[jobs.SupportChannelInboundArgs]) time.Duration {
 	return 5 * time.Minute
 }
@@ -127,9 +129,17 @@ func (s *Service) dispatchTo(ctx context.Context, a jobs.SupportChannelDispatchA
 	ct := toChannelTicket(s.d.Cfg.AppURL, t)
 	var thread channel.Thread
 	var last int64
-	err = s.d.DB.Pool.QueryRow(ctx, `SELECT COALESCE(external_thread_id,''),COALESCE(external_root_message_id,''),last_event_seq FROM support_channel_threads WHERE destination_id=$1 AND ticket_id=$2`, d.ID, t.ID).Scan(&thread.ID, &thread.RootID, &last)
+	var historySeq int64
+	var historyText string
+	var historyPosted *time.Time
+	created := false
+	err = s.d.DB.Pool.QueryRow(ctx, `SELECT COALESCE(external_thread_id,''),COALESCE(external_root_message_id,''),COALESCE(external_channel_id,''),last_event_seq,history_event_seq,history_posted_at FROM support_channel_threads WHERE destination_id=$1 AND ticket_id=$2`, d.ID, t.ID).Scan(&thread.ID, &thread.RootID, &thread.ChannelID, &last, &historySeq, &historyPosted)
 	if db.IsNotFound(err) {
-		claim, claimErr := s.d.DB.Pool.Exec(ctx, `INSERT INTO support_channel_threads(id,workspace_id,connection_id,destination_id,ticket_id,last_event_seq) VALUES($1,$2,$3,$4,$5,0) ON CONFLICT(destination_id,ticket_id) DO NOTHING`, ids.New(), a.WorkspaceID, d.ConnectionID, d.ID, t.ID)
+		historyText, historySeq, err = s.recentHistory(ctx, a.WorkspaceID, t.ID, d.IncludeNotes)
+		if err != nil {
+			return err
+		}
+		claim, claimErr := s.d.DB.Pool.Exec(ctx, `INSERT INTO support_channel_threads(id,workspace_id,connection_id,destination_id,ticket_id,last_event_seq,history_event_seq) VALUES($1,$2,$3,$4,$5,0,$6) ON CONFLICT(destination_id,ticket_id) DO NOTHING`, ids.New(), a.WorkspaceID, d.ConnectionID, d.ID, t.ID, historySeq)
 		if claimErr != nil {
 			return claimErr
 		}
@@ -145,19 +155,58 @@ func (s *Service) dispatchTo(ctx context.Context, a jobs.SupportChannelDispatchA
 		if inbound == "" {
 			inbound = d.ExternalChannelID
 		}
-		_, err = s.d.DB.Pool.Exec(ctx, `UPDATE support_channel_threads SET external_channel_id=$3,external_thread_id=$4,external_root_message_id=$5,updated_at=now() WHERE destination_id=$1 AND ticket_id=$2`, d.ID, t.ID, inbound, thread.ID, thread.RootID)
+		_, err = s.d.DB.Pool.Exec(ctx, `UPDATE support_channel_threads SET external_channel_id=$3,external_thread_id=$4,external_root_message_id=$5,card_event_seq=$6,updated_at=now() WHERE destination_id=$1 AND ticket_id=$2`, d.ID, t.ID, inbound, thread.ID, thread.RootID, a.EventSeq)
 		if err != nil {
 			return err
 		}
 		last = 0
+		historyPosted = nil
+		created = true
 	} else if err != nil {
 		return err
 	}
 	if thread.ID == "" {
 		return errors.New("support channel thread is being created")
 	}
+	if thread.ChannelID != "" {
+		creds["channel_id"] = thread.ChannelID
+	}
+	if historyPosted == nil {
+		claimed, claimErr := s.claimHistoryPost(ctx, d.ID, t.ID)
+		if claimErr != nil {
+			return claimErr
+		}
+		if !claimed {
+			now := time.Now()
+			historyPosted = &now
+		} else {
+			defer s.releaseHistoryPost(d.ID, t.ID)
+		}
+	}
+	if historyPosted == nil {
+		if !created {
+			historyText, historySeq, err = s.recentHistory(ctx, a.WorkspaceID, t.ID, d.IncludeNotes)
+			if err != nil {
+				return err
+			}
+			if _, err = s.d.DB.Pool.Exec(ctx, `UPDATE support_channel_threads SET history_event_seq=$3,updated_at=now() WHERE destination_id=$1 AND ticket_id=$2 AND history_posted_at IS NULL`, d.ID, t.ID, historySeq); err != nil {
+				return err
+			}
+		}
+		if historyText != "" {
+			if err = adapter.Post(ctx, s.http, creds, thread.ID, historyText); err != nil {
+				return s.connectionError(ctx, d.ConnectionID, err)
+			}
+		}
+		if _, err = s.d.DB.Pool.Exec(ctx, `UPDATE support_channel_threads SET history_posted_at=now(),history_processing_expires_at=NULL,updated_at=now() WHERE destination_id=$1 AND ticket_id=$2`, d.ID, t.ID); err != nil {
+			return err
+		}
+	}
 	switch typ {
 	case "message.created":
+		if a.EventSeq <= historySeq {
+			break
+		}
 		text, decodeErr := messageCreatedText(data, d.IncludeNotes)
 		if decodeErr != nil {
 			return decodeErr
@@ -169,8 +218,20 @@ func (s *Service) dispatchTo(ctx context.Context, a jobs.SupportChannelDispatchA
 		}
 	case "ticket.updated":
 		if thread.RootID != "" {
+			claimed, claimErr := s.claimCardUpdate(ctx, d.ID, t.ID, a.EventSeq)
+			if claimErr != nil {
+				return claimErr
+			}
+			if !claimed {
+				break
+			}
+			defer s.releaseCardUpdate(d.ID, t.ID, a.EventSeq)
 			if err = adapter.Update(ctx, s.http, creds, thread.RootID, ct); err != nil {
 				return s.connectionError(ctx, d.ConnectionID, err)
+			}
+			if _, err = s.d.DB.Pool.Exec(ctx, `UPDATE support_channel_threads SET card_event_seq=$3,card_processing_seq=NULL,card_processing_expires_at=NULL,updated_at=now()
+				WHERE destination_id=$1 AND ticket_id=$2 AND card_processing_seq=$3`, d.ID, t.ID, a.EventSeq); err != nil {
+				return err
 			}
 		}
 	}
@@ -182,6 +243,125 @@ func (s *Service) dispatchTo(ctx context.Context, a jobs.SupportChannelDispatchA
 		_, err = s.d.DB.Pool.Exec(ctx, `UPDATE support_channel_connections SET status='connected',last_error='',updated_at=now() WHERE id=$1 AND last_error=$2`, d.ConnectionID, deliveryError)
 	}
 	return err
+}
+
+func (s *Service) claimCardUpdate(ctx context.Context, destinationID, ticketID uuid.UUID, eventSeq int64) (bool, error) {
+	var claimed int64
+	err := s.d.DB.Pool.QueryRow(ctx, `UPDATE support_channel_threads SET
+		card_processing_seq=$3,card_processing_expires_at=now()+interval '1 minute'
+		WHERE destination_id=$1 AND ticket_id=$2 AND card_event_seq<$3
+		AND (card_processing_seq IS NULL OR card_processing_expires_at<now()) RETURNING card_processing_seq`,
+		destinationID, ticketID, eventSeq).Scan(&claimed)
+	if err == nil {
+		return true, nil
+	}
+	if !db.IsNotFound(err) {
+		return false, err
+	}
+	var current int64
+	err = s.d.DB.Pool.QueryRow(ctx, `SELECT card_event_seq FROM support_channel_threads WHERE destination_id=$1 AND ticket_id=$2`, destinationID, ticketID).Scan(&current)
+	if err != nil {
+		return false, err
+	}
+	if current >= eventSeq {
+		return false, nil
+	}
+	return false, errors.New("support channel ticket card is being updated")
+}
+
+func (s *Service) releaseCardUpdate(destinationID, ticketID uuid.UUID, eventSeq int64) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, _ = s.d.DB.Pool.Exec(ctx, `UPDATE support_channel_threads SET card_processing_seq=NULL,card_processing_expires_at=NULL
+		WHERE destination_id=$1 AND ticket_id=$2 AND card_processing_seq=$3`, destinationID, ticketID, eventSeq)
+}
+
+func (s *Service) claimHistoryPost(ctx context.Context, destinationID, ticketID uuid.UUID) (bool, error) {
+	var claimed time.Time
+	err := s.d.DB.Pool.QueryRow(ctx, `UPDATE support_channel_threads SET history_processing_expires_at=now()+interval '1 minute'
+		WHERE destination_id=$1 AND ticket_id=$2 AND history_posted_at IS NULL
+		AND (history_processing_expires_at IS NULL OR history_processing_expires_at<now())
+		RETURNING history_processing_expires_at`, destinationID, ticketID).Scan(&claimed)
+	if err == nil {
+		return true, nil
+	}
+	if !db.IsNotFound(err) {
+		return false, err
+	}
+	var posted *time.Time
+	err = s.d.DB.Pool.QueryRow(ctx, `SELECT history_posted_at FROM support_channel_threads WHERE destination_id=$1 AND ticket_id=$2`, destinationID, ticketID).Scan(&posted)
+	if err != nil {
+		return false, err
+	}
+	if posted != nil {
+		return false, nil
+	}
+	return false, errors.New("support channel recent history is being posted")
+}
+
+func (s *Service) releaseHistoryPost(destinationID, ticketID uuid.UUID) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, _ = s.d.DB.Pool.Exec(ctx, `UPDATE support_channel_threads SET history_processing_expires_at=NULL
+		WHERE destination_id=$1 AND ticket_id=$2 AND history_posted_at IS NULL`, destinationID, ticketID)
+}
+
+type historyLine struct {
+	Kind      string
+	Direction string
+	Body      string
+	CreatedAt time.Time
+}
+
+// recentHistory is the bounded public context posted once when a ticket first
+// gets a provider thread. The event cutoff prevents older dispatch jobs from
+// repeating messages already represented by this snapshot.
+func (s *Service) recentHistory(ctx context.Context, workspaceID, ticketID uuid.UUID, includeNotes bool) (string, int64, error) {
+	tx, err := s.d.DB.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return "", 0, err
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	rows, err := tx.Query(ctx, `SELECT kind,direction,body_text,created_at FROM messages
+		WHERE workspace_id=$1 AND ticket_id=$2 AND ($3 OR kind<>'note') AND body_text<>''
+		ORDER BY created_at DESC,id DESC LIMIT 5`, workspaceID, ticketID, includeNotes)
+	if err != nil {
+		return "", 0, err
+	}
+	lines, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (historyLine, error) {
+		var line historyLine
+		return line, row.Scan(&line.Kind, &line.Direction, &line.Body, &line.CreatedAt)
+	})
+	if err != nil {
+		return "", 0, err
+	}
+	var cutoff int64
+	err = tx.QueryRow(ctx, `SELECT COALESCE(max(seq),0) FROM events
+		WHERE workspace_id=$1 AND type='message.created'
+		AND COALESCE(NULLIF(data->>'ticket_id','')::uuid,NULLIF(data->'message'->>'ticket_id','')::uuid)=$2`, workspaceID, ticketID).Scan(&cutoff)
+	if err != nil {
+		return "", 0, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return "", 0, err
+	}
+	if len(lines) == 0 {
+		return "", cutoff, nil
+	}
+	var out strings.Builder
+	out.WriteString("Recent history\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := lines[i]
+		who := "Agent"
+		if line.Direction == "inbound" {
+			who = "Customer"
+		}
+		if line.Kind == "note" {
+			who = "Internal note"
+		}
+		fmt.Fprintf(&out, "\n%s · %s\n%s\n", who, line.CreatedAt.UTC().Format("2 Jan 15:04"), clip(line.Body, 500))
+	}
+	return clip(out.String(), 3200), cutoff, nil
 }
 
 type messageCreatedEvent struct {
@@ -237,12 +417,20 @@ func (s *Service) processInbound(ctx context.Context, a jobs.SupportChannelInbou
 	}
 	var raw []byte
 	var done *time.Time
-	err = s.d.DB.Pool.QueryRow(ctx, `SELECT payload,processed_at FROM support_channel_inbound_events WHERE connection_id=$1 AND external_event_id=$2`, a.ConnectionID, a.ExternalEventID).Scan(&raw, &done)
+	var orderedTicket *uuid.UUID
+	var commandSeq *int64
+	err = s.d.DB.Pool.QueryRow(ctx, `SELECT payload,processed_at,ticket_id,ticket_command_seq FROM support_channel_inbound_events WHERE connection_id=$1 AND external_event_id=$2`, a.ConnectionID, a.ExternalEventID).Scan(&raw, &done, &orderedTicket, &commandSeq)
 	if db.IsNotFound(err) || done != nil {
 		return nil
 	}
 	if err != nil {
 		return err
+	}
+	if orderedTicket != nil && commandSeq != nil {
+		if err = s.claimTicketCommand(ctx, *orderedTicket, *commandSeq); err != nil {
+			return err
+		}
+		defer s.releaseTicketCommand(*orderedTicket, *commandSeq)
 	}
 	var in channel.Inbound
 	if err = json.Unmarshal(raw, &in); err != nil {
@@ -331,7 +519,7 @@ func (s *Service) processInbound(ctx context.Context, a jobs.SupportChannelInbou
 					s.replyToProvider(ctx, adapter, creds, in, publicError(converseErr))
 					return s.finishInbound(ctx, a)
 				}
-				s.replyToProvider(ctx, adapter, creds, in, answer)
+				s.replyMessageToProvider(ctx, adapter, creds, in, answer)
 				return s.finishInbound(ctx, a)
 			}
 			if !db.IsNotFound(err) {
@@ -370,7 +558,23 @@ func (s *Service) processInbound(ctx context.Context, a jobs.SupportChannelInbou
 			s.replyToProvider(ctx, adapter, creds, in, publicError(err))
 			return s.finishInbound(ctx, a)
 		}
-		s.replyToProvider(ctx, adapter, creds, in, answer)
+		s.replyMessageToProvider(ctx, adapter, creds, in, answer)
+		return s.finishInbound(ctx, a)
+	}
+	if in.Command == "reply" || in.Command == "status" && strings.TrimSpace(in.Value) == domain.StatusClosed {
+		if _, err = domain.LoadVisibleTicket(ctx, s.d.DB.Pool, p, tid); err != nil {
+			s.replyToProvider(ctx, adapter, creds, in, publicError(err))
+			return s.finishInbound(ctx, a)
+		}
+		preview, previewErr := s.previewExplicit(ctx, p, c.ID, tid, in)
+		if previewErr != nil {
+			if errors.Is(previewErr, errConversationBusy) {
+				return previewErr
+			}
+			s.replyToProvider(ctx, adapter, creds, in, publicError(previewErr))
+			return s.finishInbound(ctx, a)
+		}
+		s.replyMessageToProvider(ctx, adapter, creds, in, preview)
 		return s.finishInbound(ctx, a)
 	}
 	err = s.applyCommand(ctx, p, tid, in)
@@ -501,12 +705,68 @@ func (s *Service) applyCommandTx(ctx context.Context, tx pgx.Tx, p *auth.Princip
 }
 
 func (s *Service) finishInbound(ctx context.Context, a jobs.SupportChannelInboundArgs) error {
-	_, err := s.d.DB.Pool.Exec(ctx, `UPDATE support_channel_inbound_events SET processed_at=now() WHERE connection_id=$1 AND external_event_id=$2`, a.ConnectionID, a.ExternalEventID)
+	return s.d.DB.Tx(ctx, func(tx pgx.Tx) error {
+		var ticketID *uuid.UUID
+		var seq *int64
+		err := tx.QueryRow(ctx, `UPDATE support_channel_inbound_events SET processed_at=COALESCE(processed_at,now())
+			WHERE connection_id=$1 AND external_event_id=$2 RETURNING ticket_id,ticket_command_seq`,
+			a.ConnectionID, a.ExternalEventID).Scan(&ticketID, &seq)
+		if db.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if ticketID != nil && seq != nil {
+			tag, err := tx.Exec(ctx, `UPDATE support_channel_ticket_lanes SET
+				next_process_seq=$2+1,processing_seq=NULL,processing_expires_at=NULL,updated_at=now()
+				WHERE ticket_id=$1 AND next_process_seq=$2 AND processing_seq=$2`, *ticketID, *seq)
+			if err != nil {
+				return err
+			}
+			if tag.RowsAffected() == 0 {
+				return errTicketCommandBusy
+			}
+		}
+		return nil
+	})
+}
+
+func (s *Service) claimTicketCommand(ctx context.Context, ticketID uuid.UUID, seq int64) error {
+	var claimed int64
+	err := s.d.DB.Pool.QueryRow(ctx, `UPDATE support_channel_ticket_lanes SET
+		processing_seq=$2,processing_expires_at=now()+interval '6 minutes',updated_at=now()
+		WHERE ticket_id=$1 AND next_process_seq=$2
+		AND (processing_seq IS NULL OR processing_expires_at<now()) RETURNING processing_seq`, ticketID, seq).Scan(&claimed)
+	if db.IsNotFound(err) {
+		return errTicketCommandBusy
+	}
 	return err
+}
+
+func (s *Service) releaseTicketCommand(ticketID uuid.UUID, seq int64) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, _ = s.d.DB.Pool.Exec(ctx, `UPDATE support_channel_ticket_lanes SET processing_seq=NULL,processing_expires_at=NULL,updated_at=now()
+		WHERE ticket_id=$1 AND processing_seq=$2`, ticketID, seq)
 }
 func (s *Service) replyToProvider(ctx context.Context, a channel.Adapter, cr map[string]string, in channel.Inbound, text string) {
 	// An empty thread posts to the channel itself (cr["channel_id"]).
 	_ = a.Post(ctx, s.http, cr, in.ExternalThreadID, text)
+}
+
+func (s *Service) replyMessageToProvider(ctx context.Context, a channel.Adapter, cr map[string]string, in channel.Inbound, message channel.Message) {
+	interactive, ok := a.(channel.InteractiveAdapter)
+	if !ok {
+		s.replyToProvider(ctx, a, cr, in, message.Text)
+		return
+	}
+	if in.SourceMessageID != "" && len(message.Actions) == 0 {
+		if err := interactive.UpdateInteractive(ctx, s.http, cr, in.SourceMessageID, message); err == nil {
+			return
+		}
+	}
+	_, _ = interactive.PostInteractive(ctx, s.http, cr, in.ExternalThreadID, message)
 }
 
 // deliveryError is a connection's error after a failed delivery. Each path clears

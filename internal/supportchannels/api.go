@@ -715,6 +715,24 @@ func (s *Service) persistInbound(ctx context.Context, c connection, items []chan
 				return err
 			}
 			if tag.RowsAffected() > 0 {
+				ticketID, err := s.resolveInboundTicket(ctx, tx, c, *item)
+				if err != nil {
+					return err
+				}
+				if ticketID != nil {
+					var seq int64
+					err = tx.QueryRow(ctx, `INSERT INTO support_channel_ticket_lanes(ticket_id,workspace_id,next_enqueue_seq)
+						VALUES($1,$2,1) ON CONFLICT(ticket_id) DO UPDATE SET
+						next_enqueue_seq=support_channel_ticket_lanes.next_enqueue_seq+1,updated_at=now()
+						RETURNING next_enqueue_seq`, *ticketID, c.WorkspaceID).Scan(&seq)
+					if err != nil {
+						return err
+					}
+					if _, err = tx.Exec(ctx, `UPDATE support_channel_inbound_events SET ticket_id=$3,ticket_command_seq=$4
+						WHERE connection_id=$1 AND external_event_id=$2`, c.ID, item.EventID, *ticketID, seq); err != nil {
+						return err
+					}
+				}
 				if _, err = s.d.Jobs.InsertTx(ctx, tx, jobs.SupportChannelInboundArgs{ConnectionID: c.ID, ExternalEventID: item.EventID}, &river.InsertOpts{MaxAttempts: 8}); err != nil {
 					return err
 				}
@@ -722,6 +740,39 @@ func (s *Service) persistInbound(ctx context.Context, c connection, items []chan
 		}
 		return nil
 	})
+}
+
+// resolveInboundTicket only establishes an ordering lane. The worker still
+// resolves the linked person and loads the ticket through domain visibility
+// before it may read or change anything.
+func (s *Service) resolveInboundTicket(ctx context.Context, tx pgx.Tx, c connection, in channel.Inbound) (*uuid.UUID, error) {
+	var id uuid.UUID
+	if in.ExternalThreadID != "" {
+		err := tx.QueryRow(ctx, `SELECT ticket_id FROM support_channel_threads
+			WHERE connection_id=$1 AND external_channel_id=$2 AND external_thread_id=$3`,
+			c.ID, in.ExternalChannelID, in.ExternalThreadID).Scan(&id)
+		if err == nil {
+			return &id, nil
+		}
+		if !db.IsNotFound(err) {
+			return nil, err
+		}
+	}
+	if in.TicketNumber > 0 {
+		err := tx.QueryRow(ctx, `SELECT t.ticket_id FROM support_channel_threads t
+			JOIN tickets k ON k.workspace_id=t.workspace_id AND k.id=t.ticket_id
+			WHERE t.connection_id=$1 AND t.workspace_id=$2 AND k.number=$3
+			AND t.external_thread_id IS NOT NULL AND t.external_channel_id IS NOT NULL
+			ORDER BY (t.external_channel_id=$4) DESC,t.updated_at DESC LIMIT 1`,
+			c.ID, c.WorkspaceID, in.TicketNumber, in.ExternalChannelID).Scan(&id)
+		if err == nil {
+			return &id, nil
+		}
+		if !db.IsNotFound(err) {
+			return nil, err
+		}
+	}
+	return nil, nil
 }
 
 func (s *Service) loadConnection(ctx context.Context, id uuid.UUID) (connection, error) {

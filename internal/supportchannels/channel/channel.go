@@ -73,6 +73,24 @@ type Ticket struct {
 	URL      string
 }
 
+// Action is a provider-neutral control. The engine owns its meaning and every
+// authorization check; adapters only translate it to their native UI.
+type Action struct {
+	Command string
+	Value   string
+	Label   string
+	Style   string // default | primary | danger | link
+	URL     string
+}
+
+// Message is a bounded piece of text with optional native controls.
+type Message struct {
+	Text    string
+	Actions []Action
+}
+
+type MessageRef struct{ ID string }
+
 type Thread struct {
 	ID     string
 	RootID string
@@ -105,6 +123,9 @@ type Inbound struct {
 	// inside its thread (a Slack slash command). The engine resolves it to the
 	// ticket's mirrored thread on the same connection.
 	TicketNumber int64 `json:",omitempty"`
+	// SourceMessageID is the provider message which held an interactive control.
+	// It lets the engine remove confirm/cancel buttons after they are consumed.
+	SourceMessageID string `json:",omitempty"`
 }
 
 // WebhookResult separates provider protocol acknowledgements from normalized
@@ -126,6 +147,13 @@ type Adapter interface {
 	CreateThread(context.Context, *http.Client, map[string]string, string, Ticket) (Thread, error)
 	Post(context.Context, *http.Client, map[string]string, string, string) error
 	Update(context.Context, *http.Client, map[string]string, string, Ticket) error
+}
+
+// InteractiveAdapter is implemented by providers with native buttons or
+// selects. The base Adapter remains text-compatible for future providers.
+type InteractiveAdapter interface {
+	PostInteractive(context.Context, *http.Client, map[string]string, string, Message) (MessageRef, error)
+	UpdateInteractive(context.Context, *http.Client, map[string]string, string, Message) error
 }
 
 // Discoverer is an optional capability for providers which expose destinations

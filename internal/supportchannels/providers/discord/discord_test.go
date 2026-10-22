@@ -143,6 +143,26 @@ func TestParseAskCommandAsConversation(t *testing.T) {
 	}
 }
 
+func TestParseComponentInteraction(t *testing.T) {
+	body := []byte(`{"id":"I3","guild_id":"G1","channel_id":"TH1","type":3,"member":{"user":{"id":"U1"}},"data":{"custom_id":"opendesk:priority","values":["urgent"]},"message":{"id":"M1"}}`)
+	result, err := (Adapter{}).Parse(http.Header{}, body)
+	if err != nil || len(result.Events) != 1 {
+		t.Fatalf("parse: %+v, %v", result, err)
+	}
+	event := result.Events[0]
+	if event.Command != "priority" || event.Value != "urgent" || event.SourceMessageID != "M1" || string(result.Body) != `{"type":6}` {
+		t.Fatalf("component: %+v body=%s", event, result.Body)
+	}
+}
+
+func TestTicketPayloadHasNativeControls(t *testing.T) {
+	payload := ticketPayload(channel.Ticket{Number: 42, Subject: "Printer", Customer: "Rae", Assignee: "Jo", Status: "open", Priority: "high", URL: "https://app.test/t/42"})
+	components, ok := payload["components"].([]any)
+	if !ok || len(components) != 3 {
+		t.Fatalf("components: %#v", payload["components"])
+	}
+}
+
 func TestConfigureLeavesAnotherConnectionsEndpoint(t *testing.T) {
 	patched := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

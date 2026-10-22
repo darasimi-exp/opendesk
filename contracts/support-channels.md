@@ -79,6 +79,13 @@ type Adapter interface {
 }
 ```
 
+Adapters with native controls also implement `InteractiveAdapter`. The engine gives it a
+provider-neutral message and actions; the adapter renders Block Kit, Discord components or
+a Telegram inline keyboard and returns the provider message id so consumed previews can be
+edited. Action payloads carry only a validated command and value. The engine derives the
+ticket from the stored thread, reloads the linked member and checks ticket visibility before
+every mutation.
+
 A provider that delivers chat over a long-lived connection also implements
 `Subscriber`: `Subscribe(ctx, client, credentials, Stream) error` runs one subscription,
 hands events to `Stream.Emit` and calls `Stream.Connected` once the provider accepts the
@@ -132,7 +139,12 @@ none for a batch without ticket events. For each matching destination:
 4. The delivery is marked complete. Provider failures set the connection to `error` and
    River retries; the next successful delivery clears the error.
 
-The root shows the ticket number, subject, customer, status, priority and opendesk URL.
+The root is an editable ticket card showing the ticket number, subject, customer, assignee,
+status, priority and opendesk URL. It offers Assign to me, status and priority controls. A
+per-thread rendering lease and event sequence keep an older delivery from overwriting a newer
+card. When a thread is first created, opendesk posts the five most recent public messages in
+chronological order (and notes only when `include_notes` is on). The thread records the event
+snapshot represented by that history so delayed message jobs do not post it again.
 Messages identify customer replies, agent replies and, where the destination includes
 them, internal notes. Stored HTML is never sent to a provider; adapters receive bounded
 plain text.
@@ -156,7 +168,9 @@ of the typed actions below; generated text is never executed as a command.
 | Ollie `create_ticket {subject,description?}` | creates a new ticket through the normal ticket service (channel `api`); Ollie answers with its number and link. It gets no thread, since version 1 mirrors email tickets only |
 
 Natural-language ticket creation, customer replies and closing a ticket wait for an explicit `confirm`
-or `cancel` response and expire after ten minutes. Drafting a reply does not send it.
+or `cancel` response and expire after ten minutes. This includes explicit reply commands. The
+preview is a native provider message with Confirm and Cancel controls; typing the words remains
+a fallback. Consuming a preview edits away its controls. Drafting a reply does not send it.
 Notes, self-assignment, status and priority changes can run immediately after the model
 emits their validated schema. A pending action and the ticket mutation are consumed in
 one transaction, so two confirmation events cannot apply it twice. A change Ollie makes
@@ -198,8 +212,8 @@ available." `/opendesk link <code>` needs no number.
 - **Slack:** bot token and signing secret. Grant `chat:write`, `app_mentions:read`,
   `channels:read` and `groups:read`, then invite the bot to each selectable channel.
   Slack does not let a bot token change its own app configuration, so the health state is
-  `action_required` and tells an admin to point Event Subscriptions and the `/opendesk`
-  slash command at `webhook_url`, then test them in Slack.
+  `action_required` and tells an admin to point Event Subscriptions, Interactivity & Shortcuts
+  and the `/opendesk` slash command at `webhook_url`, then test them in Slack.
 - **Discord:** bot token and interactions public key. opendesk lists the servers where the
   bot is installed, then lists text channels in the selected server. Install the bot with
   thread/message access and enable the privileged Message Content intent. opendesk sets
@@ -216,6 +230,7 @@ available." `/opendesk link <code>` needs no number.
   for the admin, instead of retrying. A successful session sets it back to `connected`.
 - **Telegram:** bot token. opendesk generates and seals the webhook secret, calls
   `setWebhook` with `webhook_url`, and subscribes to `message` and `my_chat_member`.
+  It also subscribes to `callback_query` for the ticket and confirmation controls.
   Add the bot as an administrator to a forum-enabled group; that signed membership update
   makes the group selectable without entering its id. Disable privacy mode with BotFather
   so the bot receives ordinary topic messages.
@@ -240,6 +255,10 @@ available." `/opendesk link <code>` needs no number.
   external thread and linked external user. A renewable processing lease serializes that
   agent's messages, and only the ten most recent turns are retained. Provider adapters only emit normalized
   chat text; they never call the model or ticket services.
+- Every inbound action resolved to a ticket receives a monotonic sequence from that ticket's
+  database lane in the same transaction that persists the signed provider event. A worker may
+  process only the head sequence. Its renewable lease survives slow Ollie turns, while a failed
+  command is retried before any later Slack, Discord or Telegram command for that ticket.
 - Provider API clients have a 15-second timeout and do not follow redirects. Their URLs
   are adapter constants, never user input.
 - Provider posts suppress link previews and mass mentions, so customer-controlled

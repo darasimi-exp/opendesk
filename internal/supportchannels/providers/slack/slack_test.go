@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/useopendesk/opendesk/internal/supportchannels/channel"
 )
 
 func TestDiscoverReturnsOnlyJoinedActiveChannels(t *testing.T) {
@@ -120,5 +122,33 @@ func TestParseRootMentionStartsConversationThread(t *testing.T) {
 	e := got.Events[0]
 	if e.Command != "chat" || e.ExternalThreadID != "20.2" || e.Text != "create a ticket for the broken printer" || !e.Directed {
 		t.Fatalf("event = %+v", e)
+	}
+}
+
+func TestParseBlockActions(t *testing.T) {
+	payload := `{"trigger_id":"T9","team":{"id":"TEAM"},"user":{"id":"U1"},"channel":{"id":"C1"},"container":{"message_ts":"10.1","thread_ts":"10.1"},"actions":[{"action_id":"opendesk:status","selected_option":{"value":"pending"}}]}`
+	body := []byte(url.Values{"payload": {payload}}.Encode())
+	result, err := (Adapter{}).Parse(http.Header{"Content-Type": []string{"application/x-www-form-urlencoded"}}, body)
+	if err != nil || len(result.Events) != 1 {
+		t.Fatalf("parse: %+v, %v", result, err)
+	}
+	event := result.Events[0]
+	if event.EventID != "T9" || event.Command != "status" || event.Value != "pending" || event.ExternalThreadID != "10.1" || event.SourceMessageID != "10.1" {
+		t.Fatalf("event: %+v", event)
+	}
+
+	payload = `{"trigger_id":"T10","team":{"id":"TEAM"},"user":{"id":"U1"},"channel":{"id":"C1"},"container":{"message_ts":"11.1","thread_ts":"10.1"},"actions":[{"action_id":"opendesk:confirm"}]}`
+	body = []byte(url.Values{"payload": {payload}}.Encode())
+	result, err = (Adapter{}).Parse(http.Header{"Content-Type": []string{"application/x-www-form-urlencoded"}}, body)
+	if err != nil || result.Events[0].Command != "chat" || result.Events[0].Text != "confirm" || result.Events[0].SourceMessageID != "11.1" {
+		t.Fatalf("confirm: %+v, %v", result.Events, err)
+	}
+}
+
+func TestTicketPayloadHasNativeControls(t *testing.T) {
+	payload := ticketPayload("C1", "", channel.Ticket{Number: 42, Subject: "Printer", Customer: "Rae", Assignee: "Jo", Status: "open", Priority: "high", URL: "https://app.test/t/42"})
+	blocks, ok := payload["blocks"].([]any)
+	if !ok || len(blocks) != 3 {
+		t.Fatalf("blocks: %#v", payload["blocks"])
 	}
 }

@@ -144,7 +144,7 @@ test("finish Slack's setup and route Telegram by channel ID", async ({ page, pro
   await destination.getByRole("button", { name: "Add destination" }).click();
   await expect(page.getByText("Finish setting up the app")).toBeVisible();
   await expect(page.getByText("Finish setup", { exact: true })).toBeVisible();
-  await proof.shot("slack-setup", { caption: "Slack waits on two settings in Slack itself: the steps and the address, until Slack calls in" });
+  await proof.shot("slack-setup", { caption: "Slack shows the event, interactivity and command settings that share its signed callback address" });
 
   await proof.chapter("Telegram", "A new bot lists no groups yet, so enter the group's ID");
   await page.getByRole("button", { name: "Telegram" }).click();

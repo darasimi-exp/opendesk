@@ -39,6 +39,10 @@ func TestConfigureAndHealth(t *testing.T) {
 	if configured["url"] != webhook || configured["secret_token"] != "secret" {
 		t.Fatalf("setWebhook: %+v", configured)
 	}
+	updates, ok := configured["allowed_updates"].([]any)
+	if !ok || len(updates) != 3 {
+		t.Fatalf("allowed updates: %#v", configured["allowed_updates"])
+	}
 	health, err := a.Health(context.Background(), server.Client(), credentials, setup)
 	if err != nil || health.Status != "healthy" {
 		t.Fatalf("health: %+v, %v", health, err)
@@ -103,6 +107,26 @@ func TestParseNaturalConversation(t *testing.T) {
 	result, err := (Adapter{}).Parse(http.Header{}, body)
 	if err != nil || len(result.Events) != 1 || result.Events[0].Command != "chat" || result.Events[0].Text != "Please summarize what happened" || result.Events[0].Directed {
 		t.Fatalf("event: %+v, %v", result.Events, err)
+	}
+}
+
+func TestParseCallbackQuery(t *testing.T) {
+	body := []byte(`{"update_id":14,"callback_query":{"id":"Q1","from":{"id":9},"data":"opendesk:status:on_hold","message":{"message_id":8,"message_thread_id":22,"chat":{"id":-10}}}}`)
+	result, err := (Adapter{}).Parse(http.Header{}, body)
+	if err != nil || len(result.Events) != 1 {
+		t.Fatalf("parse: %+v, %v", result, err)
+	}
+	event := result.Events[0]
+	if event.Command != "status" || event.Value != "on_hold" || event.ExternalThreadID != "22" || event.SourceMessageID != "8" || !strings.Contains(string(result.Body), "answerCallbackQuery") {
+		t.Fatalf("callback: %+v body=%s", event, result.Body)
+	}
+}
+
+func TestTicketPayloadHasNativeControls(t *testing.T) {
+	payload := ticketPayload("-10", "22", channel.Ticket{Number: 42, Subject: "Printer", Customer: "Rae", Assignee: "Jo", Status: "open", Priority: "high", URL: "https://app.test/t/42"})
+	markup, ok := payload["reply_markup"].(map[string]any)
+	if !ok || markup["inline_keyboard"] == nil {
+		t.Fatalf("markup: %#v", payload["reply_markup"])
 	}
 }
 

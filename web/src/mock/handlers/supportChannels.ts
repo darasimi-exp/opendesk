@@ -54,7 +54,7 @@ const discovered: Record<string, { id: string; name: string; kind: string; avail
 
 const health = (provider: string) =>
   provider === "slack"
-    ? { health_status: "action_required" as const, health_detail: "Credentials work. Verify the Events API and /opendesk request URLs in Slack." }
+    ? { health_status: "action_required" as const, health_detail: "Credentials work. Verify the Events API, interactivity and /opendesk request URLs in Slack." }
     : { health_status: "healthy" as const, health_detail: provider === "discord" ? "Discord's interactions endpoint and commands are configured." : "Telegram's webhook is configured and accepting updates." };
 const destinations: SupportChannelDestination[] = [];
 

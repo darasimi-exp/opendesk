@@ -125,7 +125,7 @@ func (a Adapter) Configure(ctx context.Context, c *http.Client, cr map[string]st
 	}
 	return a.call(ctx, c, cr, "setWebhook", map[string]any{
 		"url": setup.WebhookURL, "secret_token": cr["webhook_secret"],
-		"allowed_updates": []string{"message", "my_chat_member"},
+		"allowed_updates": []string{"message", "callback_query", "my_chat_member"},
 	}, nil)
 }
 
@@ -194,6 +194,20 @@ func (Adapter) Parse(_ http.Header, body []byte) (channel.WebhookResult, error) 
 				Status string `json:"status"`
 			} `json:"new_chat_member"`
 		} `json:"my_chat_member"`
+		CallbackQuery *struct {
+			ID   string `json:"id"`
+			Data string `json:"data"`
+			From struct {
+				ID int64 `json:"id"`
+			} `json:"from"`
+			Message struct {
+				MessageID       int64 `json:"message_id"`
+				MessageThreadID int64 `json:"message_thread_id"`
+				Chat            struct {
+					ID int64 `json:"id"`
+				} `json:"chat"`
+			} `json:"message"`
+		} `json:"callback_query"`
 	}
 	if err := json.Unmarshal(body, &x); err != nil {
 		return channel.WebhookResult{}, err
@@ -202,6 +216,23 @@ func (Adapter) Parse(_ http.Header, body []byte) (channel.WebhookResult, error) 
 		m := x.MyChatMember
 		available := (m.NewChatMember.Status == "member" || m.NewChatMember.Status == "administrator") && m.Chat.IsForum
 		return channel.WebhookResult{Destinations: []channel.Destination{{ID: strconv.FormatInt(m.Chat.ID, 10), Name: m.Chat.Title, Kind: m.Chat.Type, Available: available}}}, nil
+	}
+	if x.CallbackQuery != nil {
+		q := x.CallbackQuery
+		cmd := strings.TrimPrefix(q.Data, "opendesk:")
+		value := ""
+		if before, after, ok := strings.Cut(cmd, ":"); ok {
+			cmd, value = before, after
+		}
+		text := value
+		if cmd == "confirm" || cmd == "cancel" {
+			text, cmd = cmd, "chat"
+		}
+		ack, _ := json.Marshal(map[string]any{"method": "answerCallbackQuery", "callback_query_id": q.ID})
+		return channel.WebhookResult{
+			Events: []channel.Inbound{{EventID: q.ID, ExternalChannelID: strconv.FormatInt(q.Message.Chat.ID, 10), ExternalThreadID: strconv.FormatInt(q.Message.MessageThreadID, 10), ExternalUserID: strconv.FormatInt(q.From.ID, 10), Command: cmd, Text: text, Value: value, SourceMessageID: strconv.FormatInt(q.Message.MessageID, 10)}},
+			Status: http.StatusOK, ContentType: "application/json", Body: ack,
+		}, nil
 	}
 	if x.Message == nil {
 		return channel.WebhookResult{}, nil
@@ -261,10 +292,14 @@ func (a Adapter) CreateThread(ctx context.Context, c *http.Client, cr map[string
 		return channel.Thread{}, err
 	}
 	id := strconv.FormatInt(topic.MessageThreadID, 10)
-	if err := a.Post(ctx, c, withChannel(cr, destination), id, render(t)); err != nil {
+	var root struct {
+		MessageID int64 `json:"message_id"`
+	}
+	payload := ticketPayload(destination, id, t)
+	if err := a.call(ctx, c, withChannel(cr, destination), "sendMessage", payload, &root); err != nil {
 		return channel.Thread{}, err
 	}
-	return channel.Thread{ID: id}, nil
+	return channel.Thread{ID: id, RootID: strconv.FormatInt(root.MessageID, 10)}, nil
 }
 func withChannel(cr map[string]string, id string) map[string]string {
 	out := make(map[string]string, len(cr)+1)
@@ -281,9 +316,70 @@ func (a Adapter) Post(ctx context.Context, c *http.Client, cr map[string]string,
 		"link_preview_options": map[string]bool{"is_disabled": true},
 	}, nil)
 }
-func (Adapter) Update(context.Context, *http.Client, map[string]string, string, channel.Ticket) error {
-	return nil
+func (a Adapter) Update(ctx context.Context, c *http.Client, cr map[string]string, root string, t channel.Ticket) error {
+	messageID, _ := strconv.ParseInt(root, 10, 64)
+	payload := ticketPayload(cr["channel_id"], "", t)
+	payload["message_id"] = messageID
+	delete(payload, "message_thread_id")
+	return a.call(ctx, c, cr, "editMessageText", payload, nil)
+}
+
+func (a Adapter) PostInteractive(ctx context.Context, c *http.Client, cr map[string]string, thread string, message channel.Message) (channel.MessageRef, error) {
+	tid, _ := strconv.ParseInt(thread, 10, 64)
+	var out struct {
+		MessageID int64 `json:"message_id"`
+	}
+	payload := interactivePayload(cr["channel_id"], tid, message)
+	err := a.call(ctx, c, cr, "sendMessage", payload, &out)
+	return channel.MessageRef{ID: strconv.FormatInt(out.MessageID, 10)}, err
+}
+
+func (a Adapter) UpdateInteractive(ctx context.Context, c *http.Client, cr map[string]string, messageID string, message channel.Message) error {
+	id, _ := strconv.ParseInt(messageID, 10, 64)
+	payload := interactivePayload(cr["channel_id"], 0, message)
+	payload["message_id"] = id
+	delete(payload, "message_thread_id")
+	return a.call(ctx, c, cr, "editMessageText", payload, nil)
+}
+
+func ticketPayload(chatID, thread string, t channel.Ticket) map[string]any {
+	tid, _ := strconv.ParseInt(thread, 10, 64)
+	rows := []any{
+		[]any{callbackButton("Assign to me", "assign_self", ""), map[string]any{"text": "Open in opendesk", "url": t.URL}},
+		[]any{callbackButton("Open", "status", "open"), callbackButton("Pending", "status", "pending"), callbackButton("On hold", "status", "on_hold")},
+		[]any{callbackButton("Solved", "status", "solved"), callbackButton("Closed", "status", "closed")},
+		[]any{callbackButton("Low", "priority", "low"), callbackButton("Normal", "priority", "normal"), callbackButton("High", "priority", "high"), callbackButton("Urgent", "priority", "urgent")},
+	}
+	return map[string]any{
+		"chat_id": chatID, "message_thread_id": tid, "text": telegramText(render(t)),
+		"link_preview_options": map[string]bool{"is_disabled": true},
+		"reply_markup":         map[string]any{"inline_keyboard": rows},
+	}
+}
+
+func callbackButton(label, command, value string) map[string]any {
+	data := "opendesk:" + command
+	if value != "" {
+		data += ":" + value
+	}
+	return map[string]any{"text": label, "callback_data": data}
+}
+
+func interactivePayload(chatID string, thread int64, message channel.Message) map[string]any {
+	payload := map[string]any{"chat_id": chatID, "message_thread_id": thread, "text": telegramText(message.Text), "link_preview_options": map[string]bool{"is_disabled": true}}
+	if len(message.Actions) > 0 {
+		buttons := make([]any, 0, len(message.Actions))
+		for _, action := range message.Actions {
+			buttons = append(buttons, callbackButton(action.Label, action.Command, action.Value))
+		}
+		payload["reply_markup"] = map[string]any{"inline_keyboard": []any{buttons}}
+	} else {
+		payload["reply_markup"] = map[string]any{"inline_keyboard": []any{}}
+	}
+	return payload
 }
 func render(t channel.Ticket) string {
-	return fmt.Sprintf("#%d %s\n%s · %s · %s\n%s", t.Number, t.Subject, t.Customer, t.Status, t.Priority, t.URL)
+	return fmt.Sprintf("#%d %s\n\nCustomer: %s\nAssignee: %s\nStatus: %s\nPriority: %s\n\n%s", t.Number, t.Subject, t.Customer, t.Assignee, strings.ReplaceAll(t.Status, "_", " "), t.Priority, t.URL)
 }
+
+func telegramText(s string) string { return strings.ReplaceAll(s, "@", "@\u200b") }
